@@ -40,6 +40,9 @@ function getBrainPool() {
 
 // ============================================================================
 // Tool: take_note — guarda nota en gbrain
+// Schema real de pages: id, source_id (FK NOT NULL default 'default'), slug,
+// type, page_kind, title, compiled_truth, timeline, frontmatter (jsonb), ...
+// UNIQUE: (source_id, slug). NO tiene columna tags (van en otra tabla).
 // ============================================================================
 export async function take_note({ content, tags = [] }) {
   if (!content) return { ok: false, error: 'content_required' };
@@ -48,25 +51,27 @@ export async function take_note({ content, tags = [] }) {
 
   const now = new Date();
   const slug = `notes/voice-${now.toISOString().slice(0, 10)}-${now.toTimeString().slice(0, 8).replace(/:/g, '')}`;
-  const title = content.slice(0, 60).trim() + (content.length > 60 ? '...' : '');
+  const title = (content.slice(0, 60).trim() + (content.length > 60 ? '...' : '')) || 'Nota de voz';
   const md = `# ${title}\n\n${content}\n`;
-  const tagsArr = Array.isArray(tags) ? tags : [];
+  const tagsArr = Array.isArray(tags) ? [...tags] : [];
   tagsArr.push('voice-note');
+  const frontmatter = JSON.stringify({ tags: tagsArr, source: 'voice' });
 
   try {
     const client = await pool.connect();
     try {
       await client.query(`
-        INSERT INTO pages (slug, type, title, compiled_truth, tags, created_at, updated_at)
-        VALUES ($1, 'note', $2, $3, $4, NOW(), NOW())
-        ON CONFLICT (slug) DO UPDATE SET compiled_truth = EXCLUDED.compiled_truth, updated_at = NOW()
-      `, [slug, title, md, tagsArr]);
-      return { ok: true, slug, message: `Nota guardada en ${slug}` };
+        INSERT INTO pages (source_id, slug, type, title, compiled_truth, frontmatter, created_at, updated_at)
+        VALUES ('default', $1, 'note', $2, $3, $4::jsonb, NOW(), NOW())
+        ON CONFLICT (source_id, slug)
+        DO UPDATE SET compiled_truth = EXCLUDED.compiled_truth, updated_at = NOW()
+      `, [slug, title, md, frontmatter]);
+      return { ok: true, slug, summary: `Nota guardada` };
     } finally {
       client.release();
     }
   } catch (e) {
-    return { ok: false, error: e.message };
+    return { ok: false, error: `gbrain: ${e.message}` };
   }
 }
 

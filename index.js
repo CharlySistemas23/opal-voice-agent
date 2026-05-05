@@ -406,6 +406,16 @@ ${body}
   });
 }
 
+// Error boundary global — evita que errores no manejados maten el server.
+// Sin esto, una tool con error inesperado tumba la VM y Railway la reinicia,
+// con downtime de ~30s mid-call.
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err.message, err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
   if (err) { console.error(err); process.exit(1); }
   console.log(`[voice-agent] listening on :${PORT} model=${MODEL} public=${PUBLIC_URL || '?'}`);
