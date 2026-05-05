@@ -165,7 +165,7 @@ export async function get_dashboard_kpis({ period = 'today' } = {}) {
         WHERE created_at >= $1 AND created_at < $2 AND status = 'completed'
       ),
       cogs AS (
-        SELECT COALESCE(SUM(si.qty * COALESCE(ii.cost, 0)), 0)::numeric(14,2) AS total_cogs
+        SELECT COALESCE(SUM(si.quantity * COALESCE(ii.cost, 0)), 0)::numeric(14,2) AS total_cogs
         FROM sale_items si
         JOIN s ON si.sale_id = s.id
         LEFT JOIN inventory_items ii ON si.item_id = ii.id
@@ -235,7 +235,7 @@ export async function get_top_products({ period = 'today', limit = 5 } = {}) {
     const r = await posQuery(`
       SELECT COALESCE(ii.name, 'Item ' || si.item_id::text) AS name,
              ii.category, ii.metal,
-             SUM(si.qty)::int AS qty,
+             SUM(si.quantity)::int AS qty,
              COALESCE(SUM(si.subtotal), 0)::numeric(14,2) AS total
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.id
