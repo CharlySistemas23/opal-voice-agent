@@ -8,7 +8,7 @@ RUN apk add --no-cache curl python3
 COPY package.json bun.lock* package-lock.json* ./
 RUN bun install --frozen-lockfile || bun install
 
-COPY index.js ./
+COPY index.js tools.js ./
 
 ENV NODE_ENV=production
 ENV PORT=8765
