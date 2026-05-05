@@ -384,43 +384,37 @@ fastify.register(async (fastify) => {
 // Brain page writer
 // ============================================================================
 
+// Escribe meeting page en gbrain Postgres directamente (sin gbrain CLI — no
+// está instalado en el container). Usa el mismo pool que take_note.
+import pg from 'pg';
+const _brainPool = process.env.GBRAIN_DATABASE_URL ? new pg.Pool({
+  connectionString: process.env.GBRAIN_DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, max: 2,
+}) : null;
+
 async function writeBrainPage(transcript, from, callSid, callType) {
-  if (transcript.length === 0) return;
+  if (transcript.length === 0 || !_brainPool) return;
   const now = new Date();
   const date = now.toISOString().slice(0, 10);
   const time = now.toTimeString().slice(0, 5).replace(':', '');
   const slug = `meetings/call-${date}-${time}`;
+  const title = `Llamada ${date} ${time}`;
   const body = transcript.map(t => `**${t.role === 'user' ? 'Carlos' : 'Asistente'}**: ${t.text}`).join('\n\n');
-  const md = `---
-type: meeting
-tags: [voice-call, twilio, ${callType}]
-date: ${now.toISOString()}
-caller: "${from}"
-call_sid: "${callSid || 'unknown'}"
-call_type: "${callType}"
----
-
-# Llamada ${date} ${time}
-
-**Caller:** ${from}
-**Tipo:** ${callType}
-**Mensajes:** ${transcript.length}
-
-## Transcripción
-
-${body}
-`;
-
-  return new Promise((resolve, reject) => {
-    const proc = spawn('gbrain', ['put', slug], {
-      env: { ...process.env, PATH: `${process.env.HOME}/.bun/bin:${process.env.PATH}` },
-      stdio: ['pipe', 'inherit', 'inherit'],
-    });
-    proc.stdin.write(md);
-    proc.stdin.end();
-    proc.on('exit', code => code === 0 ? resolve() : reject(new Error(`gbrain exited ${code}`)));
-    proc.on('error', reject);
+  const md = `# ${title}\n\n**Caller:** ${from}\n**Tipo:** ${callType}\n**Mensajes:** ${transcript.length}\n\n## Transcripción\n\n${body}\n`;
+  const fm = JSON.stringify({
+    tags: ['voice-call', 'twilio', callType],
+    caller: from, call_sid: callSid || 'unknown', call_type: callType,
   });
+  const client = await _brainPool.connect();
+  try {
+    await client.query(`
+      INSERT INTO pages (source_id, slug, type, title, compiled_truth, frontmatter, created_at, updated_at)
+      VALUES ('default', $1, 'meeting', $2, $3, $4::jsonb, NOW(), NOW())
+      ON CONFLICT (source_id, slug)
+      DO UPDATE SET compiled_truth = EXCLUDED.compiled_truth, updated_at = NOW()
+    `, [slug, title, md, fm]);
+    console.log(`[brain] page creada: ${slug}`);
+  } finally { client.release(); }
 }
 
 // Error boundary global — evita que errores no manejados maten el server.
