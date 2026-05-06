@@ -42,36 +42,114 @@ async function posQuery(sql, params = []) {
   }
 }
 
-// Helper: convierte "today" / "yesterday" / "this_week" / "this_month" a SQL boundaries
-function periodToRange(period) {
+// Mapa de nombres de mes → número (0-11)
+const MONTH_MAP = {
+  enero: 0, ene: 0, january: 0, jan: 0,
+  febrero: 1, feb: 1, february: 1,
+  marzo: 2, mar: 2, march: 2,
+  abril: 3, abr: 3, april: 3, apr: 3,
+  mayo: 4, may: 4,
+  junio: 5, jun: 5, june: 5,
+  julio: 6, jul: 6, july: 6,
+  agosto: 7, ago: 7, august: 7, aug: 7,
+  septiembre: 8, sep: 8, september: 8,
+  octubre: 9, oct: 9, october: 9,
+  noviembre: 10, nov: 10, november: 10,
+  diciembre: 11, dic: 11, december: 11, dec: 11,
+};
+const MONTH_LABEL_ES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+
+// Convierte un periodo (string o {date_from,date_to}) a { from, to, label }
+// Acepta:
+//   today, yesterday, this_week, last_week, this_month, last_month
+//   last_3_months, last_6_months, this_year, last_year
+//   nombre de mes: "enero", "marzo 2024", "march", "feb 2025"
+//   YYYY-MM: "2026-03"
+//   {date_from:"2026-01-01", date_to:"2026-01-31"} (custom)
+function periodToRange(period, dateFrom, dateTo) {
+  // Custom date range
+  if (dateFrom || dateTo) {
+    const from = dateFrom ? new Date(dateFrom + 'T00:00:00') : new Date('1970-01-01');
+    const to = dateTo ? new Date(new Date(dateTo + 'T00:00:00').getTime() + 86400000) : new Date();
+    return { from, to, label: `del ${dateFrom || '?'} al ${dateTo || 'hoy'}` };
+  }
+
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const tomorrow = new Date(today.getTime() + 86400000);
-  switch ((period || 'today').toLowerCase()) {
-    case 'today':
-    case 'hoy':
+  const p = String(period || 'today').toLowerCase().trim().replace(/\s+/g, '_');
+
+  // Periodos relativos predefinidos
+  switch (p) {
+    case 'today': case 'hoy':
       return { from: today, to: tomorrow, label: 'hoy' };
-    case 'yesterday':
-    case 'ayer': {
+    case 'yesterday': case 'ayer': {
       const y = new Date(today.getTime() - 86400000);
       return { from: y, to: today, label: 'ayer' };
     }
-    case 'this_week':
-    case 'esta_semana':
-    case 'semana': {
+    case 'this_week': case 'esta_semana': case 'semana': {
       const dow = today.getDay() || 7;
       const monday = new Date(today.getTime() - (dow - 1) * 86400000);
       return { from: monday, to: tomorrow, label: 'esta semana' };
     }
-    case 'this_month':
-    case 'este_mes':
-    case 'mes': {
-      const start = new Date(now.getFullYear(), now.getMonth(), 1);
-      return { from: start, to: tomorrow, label: 'este mes' };
+    case 'last_week': case 'semana_pasada': case 'la_semana_pasada': {
+      const dow = today.getDay() || 7;
+      const lastMon = new Date(today.getTime() - (dow - 1 + 7) * 86400000);
+      const lastSun = new Date(lastMon.getTime() + 7 * 86400000);
+      return { from: lastMon, to: lastSun, label: 'la semana pasada' };
     }
-    default:
-      return { from: today, to: tomorrow, label: 'hoy' };
+    case 'this_month': case 'este_mes': case 'mes':
+      return { from: new Date(now.getFullYear(), now.getMonth(), 1), to: tomorrow, label: 'este mes' };
+    case 'last_month': case 'mes_pasado': case 'el_mes_pasado': {
+      const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const end = new Date(now.getFullYear(), now.getMonth(), 1);
+      return { from: start, to: end, label: `${MONTH_LABEL_ES[start.getMonth()]} ${start.getFullYear()}` };
+    }
+    case 'last_3_months': case 'ultimos_3_meses': case 'ultimo_trimestre': {
+      const start = new Date(now.getFullYear(), now.getMonth() - 3, 1);
+      return { from: start, to: tomorrow, label: 'últimos 3 meses' };
+    }
+    case 'last_6_months': case 'ultimos_6_meses': case 'ultimo_semestre': {
+      const start = new Date(now.getFullYear(), now.getMonth() - 6, 1);
+      return { from: start, to: tomorrow, label: 'últimos 6 meses' };
+    }
+    case 'this_year': case 'este_anio': case 'este_año': case 'anio_actual':
+      return { from: new Date(now.getFullYear(), 0, 1), to: tomorrow, label: `${now.getFullYear()}` };
+    case 'last_year': case 'anio_pasado': case 'año_pasado': case 'anio_anterior': {
+      const y = now.getFullYear() - 1;
+      return { from: new Date(y, 0, 1), to: new Date(y + 1, 0, 1), label: `${y}` };
+    }
   }
+
+  // Formato YYYY-MM (ej "2026-03")
+  const ymMatch = p.match(/^(\d{4})-(\d{2})$/);
+  if (ymMatch) {
+    const y = parseInt(ymMatch[1], 10), m = parseInt(ymMatch[2], 10) - 1;
+    return { from: new Date(y, m, 1), to: new Date(y, m + 1, 1), label: `${MONTH_LABEL_ES[m]} ${y}` };
+  }
+
+  // Nombre de mes (con o sin año): "marzo", "marzo_2024", "march_2025"
+  const tokens = p.split(/[_\s-]+/);
+  for (let i = 0; i < tokens.length; i++) {
+    const m = MONTH_MAP[tokens[i]];
+    if (m !== undefined) {
+      let y = now.getFullYear();
+      // Buscar año en los demás tokens
+      for (const t of tokens) {
+        const yNum = parseInt(t, 10);
+        if (yNum >= 2020 && yNum <= 2100) { y = yNum; break; }
+      }
+      // Si el mes ya pasó este año Y no se especifica año, asumir este año (usuario suele querer mes actual)
+      // Si el mes es FUTURO en este año Y no especificó año, asumir año pasado
+      if (!tokens.some(t => /^20\d{2}$/.test(t))) {
+        if (m > now.getMonth()) y = y - 1;
+      }
+      return { from: new Date(y, m, 1), to: new Date(y, m + 1, 1), label: `${MONTH_LABEL_ES[m]} ${y}` };
+    }
+  }
+
+  // Fallback: today
+  return { from: today, to: tomorrow, label: 'hoy' };
 }
 
 const fmtMxn = n => new Intl.NumberFormat('es-MX', { style: 'currency', currency: 'MXN', maximumFractionDigits: 0 }).format(n || 0);
@@ -123,8 +201,8 @@ export async function get_system_status() {
 // ============================================================================
 // get_sales — ventas con filtros opcionales
 // ============================================================================
-export async function get_sales({ period = 'today', branch_name, seller_name } = {}) {
-  const { from, to, label } = periodToRange(period);
+export async function get_sales({ period = 'today', branch_name, seller_name, date_from, date_to } = {}) {
+  const { from, to, label } = periodToRange(period, date_from, date_to);
   let sql = `
     SELECT COUNT(s.id)::int AS n, COALESCE(SUM(s.total), 0)::numeric(14,2) AS total,
            COALESCE(AVG(s.total), 0)::numeric(14,2) AS avg_ticket
@@ -156,8 +234,8 @@ export async function get_sales({ period = 'today', branch_name, seller_name } =
 // ============================================================================
 // get_dashboard_kpis — vista del día con utilidad estimada
 // ============================================================================
-export async function get_dashboard_kpis({ period = 'today' } = {}) {
-  const { from, to, label } = periodToRange(period);
+export async function get_dashboard_kpis({ period = 'today', date_from, date_to } = {}) {
+  const { from, to, label } = periodToRange(period, date_from, date_to);
   try {
     const r = await posQuery(`
       WITH s AS (
@@ -203,8 +281,8 @@ export async function get_dashboard_kpis({ period = 'today' } = {}) {
 // ============================================================================
 // get_top_sellers
 // ============================================================================
-export async function get_top_sellers({ period = 'today', limit = 5 } = {}) {
-  const { from, to, label } = periodToRange(period);
+export async function get_top_sellers({ period = 'today', limit = 5, date_from, date_to } = {}) {
+  const { from, to, label } = periodToRange(period, date_from, date_to);
   try {
     const r = await posQuery(`
       SELECT cs.name AS seller, COUNT(s.id)::int AS n,
@@ -229,8 +307,8 @@ export async function get_top_sellers({ period = 'today', limit = 5 } = {}) {
 // ============================================================================
 // get_top_products
 // ============================================================================
-export async function get_top_products({ period = 'today', limit = 5 } = {}) {
-  const { from, to, label } = periodToRange(period);
+export async function get_top_products({ period = 'today', limit = 5, date_from, date_to } = {}) {
+  const { from, to, label } = periodToRange(period, date_from, date_to);
   try {
     const r = await posQuery(`
       SELECT COALESCE(ii.name, 'Item ' || si.item_id::text) AS name,
@@ -357,8 +435,8 @@ export async function get_open_cash_sessions() {
 // ============================================================================
 // get_top_customers
 // ============================================================================
-export async function get_top_customers({ period = 'this_month', limit = 5 } = {}) {
-  const { from, to, label } = periodToRange(period);
+export async function get_top_customers({ period = 'this_month', limit = 5, date_from, date_to } = {}) {
+  const { from, to, label } = periodToRange(period, date_from, date_to);
   try {
     const r = await posQuery(`
       SELECT c.name, c.phone, COUNT(s.id)::int AS purchases,
@@ -421,6 +499,63 @@ export async function get_branches_summary() {
       summary: `${r.rowCount} sucursales activas: ${r.rows.map(b => b.name).join(', ')}`,
     };
   } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ============================================================================
+// get_sales_by_month — desglose mensual del año (histórico)
+// ============================================================================
+export async function get_sales_by_month({ year } = {}) {
+  const y = year || new Date().getFullYear();
+  try {
+    const r = await posQuery(`
+      SELECT
+        EXTRACT(MONTH FROM created_at)::int AS m,
+        COUNT(*)::int AS n,
+        COALESCE(SUM(total), 0)::numeric(14,2) AS total
+      FROM sales
+      WHERE EXTRACT(YEAR FROM created_at) = $1 AND status = 'completed'
+      GROUP BY EXTRACT(MONTH FROM created_at)
+      ORDER BY m
+    `, [y]);
+    const months = r.rows.map(x => ({
+      month: MONTH_LABEL_ES[x.m - 1], month_num: x.m,
+      sales_count: x.n, total: parseFloat(x.total),
+    }));
+    const total = months.reduce((a, b) => a + b.total, 0);
+    const best = months.reduce((a, b) => (b.total > (a?.total || 0) ? b : a), null);
+    return {
+      ok: true, year: y, months, total_year: total,
+      best_month: best,
+      summary: months.length === 0
+        ? `Sin ventas en ${y}`
+        : `${y}: total ${fmtMxn(total)}. Mejor mes: ${best.month} con ${fmtMxn(best.total)}`,
+    };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ============================================================================
+// compare_periods — compara ventas/utilidad entre 2 periodos
+// ============================================================================
+export async function compare_periods({ period_a, period_b }) {
+  if (!period_a || !period_b) return { ok: false, error: 'period_a y period_b requeridos' };
+  const a = await get_dashboard_kpis({ period: period_a });
+  const b = await get_dashboard_kpis({ period: period_b });
+  if (!a.ok) return { ok: false, error: `Periodo A: ${a.error}` };
+  if (!b.ok) return { ok: false, error: `Periodo B: ${b.error}` };
+  const delta = a.revenue_mxn - b.revenue_mxn;
+  const pct = b.revenue_mxn > 0 ? (delta / b.revenue_mxn) * 100 : 0;
+  const arrow = delta >= 0 ? '↑' : '↓';
+  const dir = delta >= 0 ? 'más' : 'menos';
+  return {
+    ok: true,
+    period_a: { label: a.period, revenue: a.revenue_mxn, sales: a.sales_count, gross_profit: a.gross_profit_mxn, margin: a.margin_percent },
+    period_b: { label: b.period, revenue: b.revenue_mxn, sales: b.sales_count, gross_profit: b.gross_profit_mxn, margin: b.margin_percent },
+    delta_revenue: parseFloat(delta.toFixed(2)),
+    delta_percent: parseFloat(pct.toFixed(1)),
+    summary: `${a.period}: ${fmtMxn(a.revenue_mxn)} (${a.sales_count} ventas). ` +
+             `${b.period}: ${fmtMxn(b.revenue_mxn)} (${b.sales_count} ventas). ` +
+             `${arrow} ${fmtMxn(Math.abs(delta))} ${dir} en ${a.period} (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%)`,
+  };
 }
 
 // ============================================================================
@@ -555,7 +690,9 @@ export const TOOL_DEFINITIONS = [
     type: 'function', name: 'get_sales',
     description: 'Ventas con filtros: periodo, sucursal, vendedor. Para "¿cuánto vendí hoy?", "ventas en Cancún", "qué vendió Juan esta semana".',
     parameters: { type: 'object', properties: {
-      period: { type: 'string', enum: ['today', 'yesterday', 'this_week', 'this_month'] },
+      period: { type: 'string', description: 'today | yesterday | this_week | last_week | this_month | last_month | last_3_months | last_6_months | this_year | last_year | nombre_de_mes (ej "enero", "marzo 2024") | YYYY-MM (ej "2026-03")' },
+      date_from: { type: 'string', description: 'Fecha inicio YYYY-MM-DD (override de period). Para rangos custom.' },
+      date_to: { type: 'string', description: 'Fecha fin YYYY-MM-DD (override de period).' },
       branch_name: { type: 'string', description: 'Nombre o parte del nombre de la sucursal (ILIKE).' },
       seller_name: { type: 'string', description: 'Nombre o parte del nombre del vendedor.' },
     } },
@@ -564,7 +701,9 @@ export const TOOL_DEFINITIONS = [
     type: 'function', name: 'get_top_sellers',
     description: 'Top vendedores por monto vendido. Para "¿quién vendió más?", "top vendedores".',
     parameters: { type: 'object', properties: {
-      period: { type: 'string', enum: ['today', 'yesterday', 'this_week', 'this_month'] },
+      period: { type: 'string', description: 'today | yesterday | this_week | last_week | this_month | last_month | last_3_months | last_6_months | this_year | last_year | nombre_de_mes (ej "enero", "marzo 2024") | YYYY-MM (ej "2026-03")' },
+      date_from: { type: 'string', description: 'Fecha inicio YYYY-MM-DD (override de period). Para rangos custom.' },
+      date_to: { type: 'string', description: 'Fecha fin YYYY-MM-DD (override de period).' },
       limit: { type: 'number' },
     } },
   },
@@ -572,7 +711,9 @@ export const TOOL_DEFINITIONS = [
     type: 'function', name: 'get_top_products',
     description: 'Top productos vendidos. Para "¿qué se vendió más?", "productos top".',
     parameters: { type: 'object', properties: {
-      period: { type: 'string', enum: ['today', 'yesterday', 'this_week', 'this_month'] },
+      period: { type: 'string', description: 'today | yesterday | this_week | last_week | this_month | last_month | last_3_months | last_6_months | this_year | last_year | nombre_de_mes (ej "enero", "marzo 2024") | YYYY-MM (ej "2026-03")' },
+      date_from: { type: 'string', description: 'Fecha inicio YYYY-MM-DD (override de period). Para rangos custom.' },
+      date_to: { type: 'string', description: 'Fecha fin YYYY-MM-DD (override de period).' },
       limit: { type: 'number' },
     } },
   },
@@ -580,7 +721,9 @@ export const TOOL_DEFINITIONS = [
     type: 'function', name: 'get_top_customers',
     description: 'Top clientes por monto comprado. Para "¿clientes top?", "mejores clientes".',
     parameters: { type: 'object', properties: {
-      period: { type: 'string', enum: ['today', 'yesterday', 'this_week', 'this_month'] },
+      period: { type: 'string', description: 'today | yesterday | this_week | last_week | this_month | last_month | last_3_months | last_6_months | this_year | last_year | nombre_de_mes (ej "enero", "marzo 2024") | YYYY-MM (ej "2026-03")' },
+      date_from: { type: 'string', description: 'Fecha inicio YYYY-MM-DD (override de period). Para rangos custom.' },
+      date_to: { type: 'string', description: 'Fecha fin YYYY-MM-DD (override de period).' },
       limit: { type: 'number' },
     } },
   },
@@ -625,6 +768,23 @@ export const TOOL_DEFINITIONS = [
     type: 'function', name: 'get_recent_sales',
     description: 'Últimas N ventas en detalle (folio, monto, sucursal, vendedor, cliente). Para "última venta", "ventas recientes".',
     parameters: { type: 'object', properties: { limit: { type: 'number' } } },
+  },
+  {
+    type: 'function', name: 'get_sales_by_month',
+    description: 'Desglose mensual del año (histórico). Para "¿cómo fueron las ventas mes por mes?", "¿cuál fue mi mejor mes?", "ventas de 2025".',
+    parameters: { type: 'object', properties: { year: { type: 'number', description: 'Año (default: actual)' } } },
+  },
+  {
+    type: 'function', name: 'compare_periods',
+    description: 'Compara KPIs entre 2 periodos (ventas, utilidad, margen). Para "compara enero vs febrero", "este mes vs el pasado", "2024 vs 2025".',
+    parameters: {
+      type: 'object',
+      properties: {
+        period_a: { type: 'string', description: 'Periodo A (ej "marzo", "this_month", "2026-03", "marzo 2024")' },
+        period_b: { type: 'string', description: 'Periodo B' },
+      },
+      required: ['period_a', 'period_b'],
+    },
   },
 
   // ============ SISTEMA / OPERACIÓN ============
@@ -673,6 +833,8 @@ export async function dispatchTool(name, args) {
     case 'get_employees_summary':  return get_employees_summary(args);
     case 'get_branches_summary':   return get_branches_summary();
     case 'get_recent_sales':       return get_recent_sales(args);
+    case 'get_sales_by_month':     return get_sales_by_month(args);
+    case 'compare_periods':        return compare_periods(args);
     case 'get_recent_errors':      return get_recent_errors(args);
     case 'restart_backend':        return restart_backend();
     case 'create_issue':           return create_issue(args);
