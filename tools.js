@@ -744,6 +744,29 @@ export const TOOL_DEFINITIONS = [
     }, required: ['content'] },
   },
   {
+    type: 'function', name: 'get_recent_notes',
+    description: 'Lee las notas/recordatorios que Carlos ha guardado. Úsalo cuando pregunte "¿qué te dije?", "¿qué anoté?", "¿qué tenía que recordar?", "¿qué pendientes tengo?", "¿qué hablamos antes?". Lista en orden cronológico, más reciente primero.',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Cuántas notas mostrar (max 20). Default 5.' },
+        days_back: { type: 'number', description: 'Buscar en los últimos N días. Default 14.' },
+      },
+    },
+  },
+  {
+    type: 'function', name: 'search_brain',
+    description: 'Busca por palabra clave en TODAS las notas, meetings y páginas guardadas. Úsalo cuando pregunte algo específico como "¿qué dije sobre Carmina?", "¿hablé de oro?", "¿qué anoté del proveedor X?".',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Palabra o frase a buscar (ej "Carmina", "oro Navidad", "reunión proveedor")' },
+        limit: { type: 'number', description: 'Cuántos resultados (max 20). Default 5.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     type: 'function', name: 'schedule_callback',
     description: 'Programa una llamada de regreso al teléfono actual del usuario en N minutos. Para "llámame en X min", "márcame de regreso".',
     parameters: { type: 'object', properties: {
@@ -894,6 +917,8 @@ export const TOOL_DEFINITIONS = [
 export async function dispatchTool(name, args) {
   switch (name) {
     case 'take_note':              return take_note(args);
+    case 'get_recent_notes':       return get_recent_notes(args);
+    case 'search_brain':           return search_brain(args);
     case 'get_system_status':      return get_system_status();
     case 'get_dashboard_kpis':     return get_dashboard_kpis(args);
     case 'get_sales':              return get_sales(args);
