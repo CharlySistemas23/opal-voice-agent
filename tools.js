@@ -234,6 +234,92 @@ export async function take_note({ content, tags = [] }) {
 // ============================================================================
 // get_system_status
 // ============================================================================
+// get_recent_notes — últimas notas/recordatorios para "qué te dije/anoté"
+export async function get_recent_notes({ limit = 5, days_back = 14 } = {}) {
+  const pool = getBrainPool();
+  if (!pool) return { ok: false, error: 'gbrain_not_configured' };
+  try {
+    const client = await pool.connect();
+    try {
+      const r = await client.query(`
+        SELECT slug, title, compiled_truth, created_at
+        FROM pages
+        WHERE type IN ('note', 'meeting')
+          AND deleted_at IS NULL
+          AND created_at >= NOW() - ($1 || ' days')::interval
+        ORDER BY created_at DESC
+        LIMIT $2
+      `, [String(days_back), Math.min(limit, 20)]);
+      const notes = r.rows.map(x => {
+        const lines = (x.compiled_truth || '').split('\n');
+        const userLines = lines
+          .filter(l => l.startsWith('**Carlos**:'))
+          .map(l => l.replace('**Carlos**:', '').trim());
+        const contentLines = lines.filter(l =>
+          !l.startsWith('#') &&
+          !l.startsWith('**') &&
+          !l.startsWith('## ') &&
+          l.trim() !== ''
+        );
+        const cleanContent = userLines.length > 0
+          ? userLines.join(' | ')
+          : contentLines.slice(0, 3).join(' ').trim();
+        return {
+          slug: x.slug,
+          title: x.title,
+          when: x.created_at.toISOString().slice(0, 16).replace('T', ' '),
+          content: cleanContent.slice(0, 300),
+        };
+      });
+      return {
+        ok: true, count: notes.length, notes,
+        summary: notes.length === 0
+          ? `Sin notas en los últimos ${days_back} días`
+          : `${notes.length} notas. Más reciente (${notes[0].when}): ${notes[0].content.slice(0, 220)}`,
+      };
+    } finally { client.release(); }
+  } catch (e) { return { ok: false, error: `gbrain: ${e.message}` }; }
+}
+
+// search_brain — búsqueda full-text en pages
+export async function search_brain({ query, limit = 5 }) {
+  if (!query) return { ok: false, error: 'query_required' };
+  const pool = getBrainPool();
+  if (!pool) return { ok: false, error: 'gbrain_not_configured' };
+  try {
+    const client = await pool.connect();
+    try {
+      const r = await client.query(`
+        SELECT slug, type, title, compiled_truth, created_at
+        FROM pages
+        WHERE deleted_at IS NULL
+          AND (compiled_truth ILIKE $1 OR title ILIKE $1)
+        ORDER BY created_at DESC
+        LIMIT $2
+      `, [`%${query}%`, Math.min(limit, 20)]);
+      const results = r.rows.map(x => {
+        const text = x.compiled_truth || '';
+        const idx = text.toLowerCase().indexOf(query.toLowerCase());
+        const start = Math.max(0, idx - 80);
+        const snippet = idx === -1
+          ? text.slice(0, 200)
+          : '...' + text.slice(start, idx + 120 + query.length).replace(/\n+/g, ' ').trim() + '...';
+        return {
+          slug: x.slug, type: x.type, title: x.title,
+          when: x.created_at.toISOString().slice(0, 16).replace('T', ' '),
+          snippet,
+        };
+      });
+      return {
+        ok: true, count: results.length, results,
+        summary: results.length === 0
+          ? `No encontré "${query}" en notas`
+          : `${results.length} resultados para "${query}". Más reciente (${results[0].when}): ${results[0].snippet.slice(0, 220)}`,
+      };
+    } finally { client.release(); }
+  } catch (e) { return { ok: false, error: `gbrain: ${e.message}` }; }
+}
+
 export async function get_system_status() {
   const url = process.env.POS_HEALTH_URL || 'https://backend-production-6260.up.railway.app/health';
   try {
