@@ -42,19 +42,36 @@ async function posQuery(sql, params = []) {
   }
 }
 
-// Universo unificado de ventas: sales + quick_captures con conversión USD/CAD→MXN.
-// Las quick_captures son ventas turísticas que no entran a sales pero SÍ son ventas
-// reales del negocio. El POS las cuenta juntas en sus reportes.
-// Tipos de cambio aproximados — si quieres precisión usa exchange_rates_daily.
+// Universo unificado de ventas — fuente de verdad: el POS calcula totales mediante
+// archived_quick_capture_reports (los reportes archivados ya tienen conversiones,
+// comisiones, etc. resueltas por la lógica del frontend). Para días NO archivados
+// usamos sales + quick_captures con conversión USD×20, CAD×14.5.
+//
+// Lógica:
+//   - Para cada día: si existe archived_quick_capture_reports.total_sales_mxn,
+//     usar ese (es el "número oficial" del POS).
+//   - Para días NO archivados: sumar sales + quick_captures crudos.
 const UNIFIED_SALES_CTE = `
-  WITH unified_sales AS (
+  WITH archived_days AS (
+    SELECT report_date::date AS day,
+           SUM(total_sales_mxn)::numeric(14,2) AS revenue
+    FROM archived_quick_capture_reports
+    GROUP BY report_date::date
+  ),
+  archived_set AS (
+    SELECT day FROM archived_days
+  ),
+  unified_sales AS (
+    -- Ventas POS (sales) en días NO archivados
     SELECT s.id, s.branch_id, s.seller_id, s.guide_id, s.agency_id, s.customer_id,
            s.total::numeric(14,2) AS total_mxn,
            s.created_at,
            'sale'::text AS source
     FROM sales s
     WHERE s.status = 'completed'
+      AND s.created_at::date NOT IN (SELECT day FROM archived_set)
     UNION ALL
+    -- Quick captures en días NO archivados
     SELECT qc.id, qc.branch_id, qc.seller_id, qc.guide_id, qc.agency_id, NULL::uuid AS customer_id,
            (CASE
               WHEN qc.currency = 'USD' THEN qc.total * 20
@@ -64,6 +81,15 @@ const UNIFIED_SALES_CTE = `
            COALESCE(qc.date::timestamp with time zone, qc.created_at) AS created_at,
            'quick_capture'::text AS source
     FROM quick_captures qc
+    WHERE COALESCE(qc.date, qc.created_at::date) NOT IN (SELECT day FROM archived_set)
+    UNION ALL
+    -- Reportes archivados (1 row por día) — el "número oficial" del POS
+    SELECT a.id, a.branch_id, NULL::uuid AS seller_id, NULL::uuid AS guide_id,
+           NULL::uuid AS agency_id, NULL::uuid AS customer_id,
+           a.total_sales_mxn::numeric(14,2) AS total_mxn,
+           a.report_date::timestamp with time zone AS created_at,
+           'archived'::text AS source
+    FROM archived_quick_capture_reports a
   )
 `;
 
