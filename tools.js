@@ -341,13 +341,9 @@ export async function get_system_status() {
 export async function get_sales({ period = 'today', branch_name, seller_name, date_from, date_to } = {}) {
   const { from, to, label } = periodToRange(period, date_from, date_to);
   let sql = `${UNIFIED_SALES_CTE}
-    SELECT COUNT(us.id)::int AS n,
-           COALESCE(SUM(us.total_mxn), 0)::numeric(14,2) AS total,
-           COALESCE(AVG(us.total_mxn), 0)::numeric(14,2) AS avg_ticket,
-           SUM(CASE WHEN us.source='sale' THEN 1 ELSE 0 END)::int AS sales_count,
-           SUM(CASE WHEN us.source='quick_capture' THEN 1 ELSE 0 END)::int AS qc_count,
-           SUM(CASE WHEN us.source='sale' THEN us.total_mxn ELSE 0 END)::numeric(14,2) AS sales_total,
-           SUM(CASE WHEN us.source='quick_capture' THEN us.total_mxn ELSE 0 END)::numeric(14,2) AS qc_total
+    SELECT COALESCE(b.name, 'Sin sucursal') AS branch_name,
+           COUNT(us.id)::int AS n,
+           COALESCE(SUM(us.total_mxn), 0)::numeric(14,2) AS total
     FROM unified_sales us
     LEFT JOIN branches b ON us.branch_id = b.id
     LEFT JOIN catalog_sellers cs ON us.seller_id = cs.id
@@ -356,24 +352,29 @@ export async function get_sales({ period = 'today', branch_name, seller_name, da
   const params = [from, to];
   if (branch_name) { params.push(`%${branch_name}%`); sql += ` AND b.name ILIKE $${params.length}`; }
   if (seller_name) { params.push(`%${seller_name}%`); sql += ` AND cs.name ILIKE $${params.length}`; }
+  sql += ` GROUP BY b.name ORDER BY total DESC`;
   try {
     const r = await posQuery(sql, params);
-    const row = r.rows[0];
+    const byBranch = r.rows.map(x => ({
+      branch: x.branch_name, n: x.n, total: parseFloat(x.total),
+    }));
+    const total = byBranch.reduce((a, b) => a + b.total, 0);
+    const totalN = byBranch.reduce((a, b) => a + b.n, 0);
     let scope = label;
     if (branch_name) scope += ` en ${branch_name}`;
     if (seller_name) scope += ` por ${seller_name}`;
-    const total = parseFloat(row.total);
+    let summary;
+    if (totalN === 0) {
+      summary = `Cero ventas ${scope}`;
+    } else if (byBranch.length === 1) {
+      summary = `${totalN} ventas ${scope} en ${byBranch[0].branch}: ${fmtMxn(total)}`;
+    } else {
+      const breakdown = byBranch.map(b => `${b.branch} ${fmtMxn(b.total)}`).join(', ');
+      summary = `${totalN} ventas ${scope} por ${fmtMxn(total)} — ${breakdown}`;
+    }
     return {
-      ok: true,
-      period: label, n: row.n,
-      total_mxn: total, avg_ticket: parseFloat(row.avg_ticket),
-      breakdown: {
-        sales: { count: row.sales_count, total: parseFloat(row.sales_total) },
-        quick_captures: { count: row.qc_count, total: parseFloat(row.qc_total) },
-      },
-      summary: row.n === 0
-        ? `Cero ventas ${scope}`
-        : `${row.n} ventas ${scope} por ${fmtMxn(total)} (${row.sales_count} POS + ${row.qc_count} captura rápida)`,
+      ok: true, period: label, n: totalN, total_mxn: total,
+      by_branch: byBranch, summary,
     };
   } catch (e) { return { ok: false, error: e.message }; }
 }
@@ -384,55 +385,53 @@ export async function get_sales({ period = 'today', branch_name, seller_name, da
 export async function get_dashboard_kpis({ period = 'today', date_from, date_to } = {}) {
   const { from, to, label } = periodToRange(period, date_from, date_to);
   try {
-    const r = await posQuery(`${UNIFIED_SALES_CTE},
-      filtered AS (
-        SELECT * FROM unified_sales WHERE created_at >= $1 AND created_at < $2
-      ),
-      cogs AS (
-        SELECT COALESCE(SUM(si.quantity * COALESCE(ii.cost, 0)), 0)::numeric(14,2) AS total_cogs
-        FROM sale_items si
-        JOIN filtered f ON si.sale_id = f.id AND f.source = 'sale'
-        LEFT JOIN inventory_items ii ON si.item_id = ii.id
-      ),
-      qc_cogs AS (
-        SELECT COALESCE(SUM(COALESCE(qc.merchandise_cost, 0)), 0)::numeric(14,2) AS total_cogs
-        FROM quick_captures qc
-        JOIN filtered f ON qc.id = f.id AND f.source = 'quick_capture'
-      ),
-      commissions AS (
-        SELECT COALESCE(SUM(COALESCE(si.seller_commission,0) + COALESCE(si.guide_commission,0)), 0)::numeric(14,2) AS total
-        FROM sale_items si JOIN filtered f ON si.sale_id = f.id AND f.source = 'sale'
-      )
-      SELECT
-        (SELECT COUNT(*) FROM filtered)::int AS total_n,
-        (SELECT COUNT(*) FROM filtered WHERE source='sale')::int AS sales_n,
-        (SELECT COUNT(*) FROM filtered WHERE source='quick_capture')::int AS qc_n,
-        (SELECT COALESCE(SUM(total_mxn),0) FROM filtered)::numeric(14,2) AS revenue,
-        (SELECT COALESCE(SUM(total_mxn),0) FROM filtered WHERE source='sale')::numeric(14,2) AS sales_revenue,
-        (SELECT COALESCE(SUM(total_mxn),0) FROM filtered WHERE source='quick_capture')::numeric(14,2) AS qc_revenue,
-        ((SELECT total_cogs FROM cogs) + (SELECT total_cogs FROM qc_cogs))::numeric(14,2) AS cogs,
-        (SELECT total FROM commissions) AS commissions,
-        (SELECT COUNT(DISTINCT branch_id) FROM filtered)::int AS active_branches
+    const r = await posQuery(`${UNIFIED_SALES_CTE}
+      SELECT COALESCE(b.name, 'Sin sucursal') AS branch_name,
+             COUNT(us.id)::int AS n,
+             COALESCE(SUM(us.total_mxn), 0)::numeric(14,2) AS revenue
+      FROM unified_sales us
+      LEFT JOIN branches b ON us.branch_id = b.id
+      WHERE us.created_at >= $1 AND us.created_at < $2
+      GROUP BY b.name
+      ORDER BY revenue DESC
     `, [from, to]);
-    const k = r.rows[0];
-    const revenue = parseFloat(k.revenue), cogs = parseFloat(k.cogs), comm = parseFloat(k.commissions);
+    const byBranch = r.rows.map(x => ({
+      branch: x.branch_name, n: x.n, revenue: parseFloat(x.revenue),
+    }));
+    const totalN = byBranch.reduce((a, b) => a + b.n, 0);
+    const revenue = byBranch.reduce((a, b) => a + b.revenue, 0);
+
+    // COGS y comisiones (sales table only)
+    const cogsR = await posQuery(`
+      SELECT COALESCE(SUM(si.quantity * COALESCE(ii.cost,0)),0)::numeric(14,2) AS cogs,
+             COALESCE(SUM(COALESCE(si.seller_commission,0)+COALESCE(si.guide_commission,0)),0)::numeric(14,2) AS comm
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.id
+      LEFT JOIN inventory_items ii ON si.item_id = ii.id
+      WHERE s.created_at >= $1 AND s.created_at < $2 AND s.status='completed'
+    `, [from, to]);
+    const cogs = parseFloat(cogsR.rows[0].cogs);
+    const comm = parseFloat(cogsR.rows[0].comm);
     const gross = revenue - cogs - comm;
     const margin = revenue > 0 ? (gross / revenue) * 100 : 0;
+
+    let summary;
+    if (totalN === 0) {
+      summary = `Sin ventas ${label}`;
+    } else if (byBranch.length === 1) {
+      summary = `${label} en ${byBranch[0].branch}: ${totalN} ventas, ${fmtMxn(revenue)}, utilidad ${fmtMxn(gross)} (margen ${margin.toFixed(0)}%)`;
+    } else {
+      const top = byBranch.slice(0, 3).map(b => `${b.branch} ${fmtMxn(b.revenue)}`).join(', ');
+      summary = `${label}: ${totalN} ventas total ${fmtMxn(revenue)} (${top}). Utilidad ${fmtMxn(gross)} (margen ${margin.toFixed(0)}%)`;
+    }
+
     return {
-      ok: true,
-      period: label,
-      sales_count: k.total_n,
-      breakdown: {
-        sales: { count: k.sales_n, revenue: parseFloat(k.sales_revenue) },
-        quick_captures: { count: k.qc_n, revenue: parseFloat(k.qc_revenue) },
-      },
+      ok: true, period: label, sales_count: totalN,
       revenue_mxn: revenue, cogs_mxn: cogs, commissions_mxn: comm,
       gross_profit_mxn: parseFloat(gross.toFixed(2)),
       margin_percent: parseFloat(margin.toFixed(1)),
-      active_branches: k.active_branches,
-      summary: k.total_n === 0
-        ? `Sin ventas ${label}`
-        : `${k.total_n} ventas ${label} por ${fmtMxn(revenue)} (${k.sales_n} POS ${fmtMxn(k.sales_revenue)} + ${k.qc_n} captura rápida ${fmtMxn(k.qc_revenue)}), utilidad ${fmtMxn(gross)} (margen ${margin.toFixed(0)}%)`,
+      by_branch: byBranch, active_branches: byBranch.length,
+      summary,
     };
   } catch (e) { return { ok: false, error: e.message }; }
 }
