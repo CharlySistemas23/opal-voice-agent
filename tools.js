@@ -42,6 +42,31 @@ async function posQuery(sql, params = []) {
   }
 }
 
+// Universo unificado de ventas: sales + quick_captures con conversión USD/CAD→MXN.
+// Las quick_captures son ventas turísticas que no entran a sales pero SÍ son ventas
+// reales del negocio. El POS las cuenta juntas en sus reportes.
+// Tipos de cambio aproximados — si quieres precisión usa exchange_rates_daily.
+const UNIFIED_SALES_CTE = `
+  WITH unified_sales AS (
+    SELECT s.id, s.branch_id, s.seller_id, s.guide_id, s.agency_id, s.customer_id,
+           s.total::numeric(14,2) AS total_mxn,
+           s.created_at,
+           'sale'::text AS source
+    FROM sales s
+    WHERE s.status = 'completed'
+    UNION ALL
+    SELECT qc.id, qc.branch_id, qc.seller_id, qc.guide_id, qc.agency_id, NULL::uuid AS customer_id,
+           (CASE
+              WHEN qc.currency = 'USD' THEN qc.total * 20
+              WHEN qc.currency = 'CAD' THEN qc.total * 14.5
+              ELSE qc.total
+            END)::numeric(14,2) AS total_mxn,
+           COALESCE(qc.date::timestamp with time zone, qc.created_at) AS created_at,
+           'quick_capture'::text AS source
+    FROM quick_captures qc
+  )
+`;
+
 // Mapa de nombres de mes → número (0-11)
 const MONTH_MAP = {
   enero: 0, ene: 0, january: 0, jan: 0,
@@ -203,13 +228,18 @@ export async function get_system_status() {
 // ============================================================================
 export async function get_sales({ period = 'today', branch_name, seller_name, date_from, date_to } = {}) {
   const { from, to, label } = periodToRange(period, date_from, date_to);
-  let sql = `
-    SELECT COUNT(s.id)::int AS n, COALESCE(SUM(s.total), 0)::numeric(14,2) AS total,
-           COALESCE(AVG(s.total), 0)::numeric(14,2) AS avg_ticket
-    FROM sales s
-    LEFT JOIN branches b ON s.branch_id = b.id
-    LEFT JOIN catalog_sellers cs ON s.seller_id = cs.id
-    WHERE s.created_at >= $1 AND s.created_at < $2 AND s.status = 'completed'
+  let sql = `${UNIFIED_SALES_CTE}
+    SELECT COUNT(us.id)::int AS n,
+           COALESCE(SUM(us.total_mxn), 0)::numeric(14,2) AS total,
+           COALESCE(AVG(us.total_mxn), 0)::numeric(14,2) AS avg_ticket,
+           SUM(CASE WHEN us.source='sale' THEN 1 ELSE 0 END)::int AS sales_count,
+           SUM(CASE WHEN us.source='quick_capture' THEN 1 ELSE 0 END)::int AS qc_count,
+           SUM(CASE WHEN us.source='sale' THEN us.total_mxn ELSE 0 END)::numeric(14,2) AS sales_total,
+           SUM(CASE WHEN us.source='quick_capture' THEN us.total_mxn ELSE 0 END)::numeric(14,2) AS qc_total
+    FROM unified_sales us
+    LEFT JOIN branches b ON us.branch_id = b.id
+    LEFT JOIN catalog_sellers cs ON us.seller_id = cs.id
+    WHERE us.created_at >= $1 AND us.created_at < $2
   `;
   const params = [from, to];
   if (branch_name) { params.push(`%${branch_name}%`); sql += ` AND b.name ILIKE $${params.length}`; }
@@ -220,13 +250,18 @@ export async function get_sales({ period = 'today', branch_name, seller_name, da
     let scope = label;
     if (branch_name) scope += ` en ${branch_name}`;
     if (seller_name) scope += ` por ${seller_name}`;
+    const total = parseFloat(row.total);
     return {
       ok: true,
       period: label, n: row.n,
-      total_mxn: parseFloat(row.total), avg_ticket: parseFloat(row.avg_ticket),
+      total_mxn: total, avg_ticket: parseFloat(row.avg_ticket),
+      breakdown: {
+        sales: { count: row.sales_count, total: parseFloat(row.sales_total) },
+        quick_captures: { count: row.qc_count, total: parseFloat(row.qc_total) },
+      },
       summary: row.n === 0
         ? `Cero ventas ${scope}`
-        : `${row.n} ventas ${scope} por ${fmtMxn(row.total)}, ticket promedio ${fmtMxn(row.avg_ticket)}`,
+        : `${row.n} ventas ${scope} por ${fmtMxn(total)} (${row.sales_count} POS + ${row.qc_count} captura rápida)`,
     };
   } catch (e) { return { ok: false, error: e.message }; }
 }
@@ -237,27 +272,35 @@ export async function get_sales({ period = 'today', branch_name, seller_name, da
 export async function get_dashboard_kpis({ period = 'today', date_from, date_to } = {}) {
   const { from, to, label } = periodToRange(period, date_from, date_to);
   try {
-    const r = await posQuery(`
-      WITH s AS (
-        SELECT id, total, branch_id FROM sales
-        WHERE created_at >= $1 AND created_at < $2 AND status = 'completed'
+    const r = await posQuery(`${UNIFIED_SALES_CTE},
+      filtered AS (
+        SELECT * FROM unified_sales WHERE created_at >= $1 AND created_at < $2
       ),
       cogs AS (
         SELECT COALESCE(SUM(si.quantity * COALESCE(ii.cost, 0)), 0)::numeric(14,2) AS total_cogs
         FROM sale_items si
-        JOIN s ON si.sale_id = s.id
+        JOIN filtered f ON si.sale_id = f.id AND f.source = 'sale'
         LEFT JOIN inventory_items ii ON si.item_id = ii.id
+      ),
+      qc_cogs AS (
+        SELECT COALESCE(SUM(COALESCE(qc.merchandise_cost, 0)), 0)::numeric(14,2) AS total_cogs
+        FROM quick_captures qc
+        JOIN filtered f ON qc.id = f.id AND f.source = 'quick_capture'
       ),
       commissions AS (
         SELECT COALESCE(SUM(COALESCE(si.seller_commission,0) + COALESCE(si.guide_commission,0)), 0)::numeric(14,2) AS total
-        FROM sale_items si JOIN s ON si.sale_id = s.id
+        FROM sale_items si JOIN filtered f ON si.sale_id = f.id AND f.source = 'sale'
       )
       SELECT
-        (SELECT COUNT(*) FROM s)::int AS sales_n,
-        (SELECT COALESCE(SUM(total),0) FROM s)::numeric(14,2) AS revenue,
-        (SELECT total_cogs FROM cogs) AS cogs,
+        (SELECT COUNT(*) FROM filtered)::int AS total_n,
+        (SELECT COUNT(*) FROM filtered WHERE source='sale')::int AS sales_n,
+        (SELECT COUNT(*) FROM filtered WHERE source='quick_capture')::int AS qc_n,
+        (SELECT COALESCE(SUM(total_mxn),0) FROM filtered)::numeric(14,2) AS revenue,
+        (SELECT COALESCE(SUM(total_mxn),0) FROM filtered WHERE source='sale')::numeric(14,2) AS sales_revenue,
+        (SELECT COALESCE(SUM(total_mxn),0) FROM filtered WHERE source='quick_capture')::numeric(14,2) AS qc_revenue,
+        ((SELECT total_cogs FROM cogs) + (SELECT total_cogs FROM qc_cogs))::numeric(14,2) AS cogs,
         (SELECT total FROM commissions) AS commissions,
-        (SELECT COUNT(DISTINCT branch_id) FROM s)::int AS active_branches
+        (SELECT COUNT(DISTINCT branch_id) FROM filtered)::int AS active_branches
     `, [from, to]);
     const k = r.rows[0];
     const revenue = parseFloat(k.revenue), cogs = parseFloat(k.cogs), comm = parseFloat(k.commissions);
@@ -266,14 +309,18 @@ export async function get_dashboard_kpis({ period = 'today', date_from, date_to 
     return {
       ok: true,
       period: label,
-      sales_count: k.sales_n,
+      sales_count: k.total_n,
+      breakdown: {
+        sales: { count: k.sales_n, revenue: parseFloat(k.sales_revenue) },
+        quick_captures: { count: k.qc_n, revenue: parseFloat(k.qc_revenue) },
+      },
       revenue_mxn: revenue, cogs_mxn: cogs, commissions_mxn: comm,
       gross_profit_mxn: parseFloat(gross.toFixed(2)),
       margin_percent: parseFloat(margin.toFixed(1)),
       active_branches: k.active_branches,
-      summary: k.sales_n === 0
+      summary: k.total_n === 0
         ? `Sin ventas ${label}`
-        : `${k.sales_n} ventas ${label} por ${fmtMxn(revenue)}, utilidad bruta ${fmtMxn(gross)} (margen ${margin.toFixed(0)}%)`,
+        : `${k.total_n} ventas ${label} por ${fmtMxn(revenue)} (${k.sales_n} POS ${fmtMxn(k.sales_revenue)} + ${k.qc_n} captura rápida ${fmtMxn(k.qc_revenue)}), utilidad ${fmtMxn(gross)} (margen ${margin.toFixed(0)}%)`,
     };
   } catch (e) { return { ok: false, error: e.message }; }
 }
@@ -284,12 +331,12 @@ export async function get_dashboard_kpis({ period = 'today', date_from, date_to 
 export async function get_top_sellers({ period = 'today', limit = 5, date_from, date_to } = {}) {
   const { from, to, label } = periodToRange(period, date_from, date_to);
   try {
-    const r = await posQuery(`
-      SELECT cs.name AS seller, COUNT(s.id)::int AS n,
-             COALESCE(SUM(s.total), 0)::numeric(14,2) AS total
-      FROM sales s
-      JOIN catalog_sellers cs ON s.seller_id = cs.id
-      WHERE s.created_at >= $1 AND s.created_at < $2 AND s.status = 'completed'
+    const r = await posQuery(`${UNIFIED_SALES_CTE}
+      SELECT cs.name AS seller, COUNT(us.id)::int AS n,
+             COALESCE(SUM(us.total_mxn), 0)::numeric(14,2) AS total
+      FROM unified_sales us
+      JOIN catalog_sellers cs ON us.seller_id = cs.id
+      WHERE us.created_at >= $1 AND us.created_at < $2
       GROUP BY cs.name
       ORDER BY total DESC
       LIMIT $3
@@ -437,6 +484,7 @@ export async function get_open_cash_sessions() {
 // ============================================================================
 export async function get_top_customers({ period = 'this_month', limit = 5, date_from, date_to } = {}) {
   const { from, to, label } = periodToRange(period, date_from, date_to);
+  // Customers solo viven en sales (quick_captures no tiene customer_id)
   try {
     const r = await posQuery(`
       SELECT c.name, c.phone, COUNT(s.id)::int AS purchases,
@@ -507,14 +555,14 @@ export async function get_branches_summary() {
 export async function get_sales_by_month({ year } = {}) {
   const y = year || new Date().getFullYear();
   try {
-    const r = await posQuery(`
+    const r = await posQuery(`${UNIFIED_SALES_CTE}
       SELECT
-        EXTRACT(MONTH FROM created_at)::int AS m,
+        EXTRACT(MONTH FROM us.created_at)::int AS m,
         COUNT(*)::int AS n,
-        COALESCE(SUM(total), 0)::numeric(14,2) AS total
-      FROM sales
-      WHERE EXTRACT(YEAR FROM created_at) = $1 AND status = 'completed'
-      GROUP BY EXTRACT(MONTH FROM created_at)
+        COALESCE(SUM(us.total_mxn), 0)::numeric(14,2) AS total
+      FROM unified_sales us
+      WHERE EXTRACT(YEAR FROM us.created_at) = $1
+      GROUP BY EXTRACT(MONTH FROM us.created_at)
       ORDER BY m
     `, [y]);
     const months = r.rows.map(x => ({
