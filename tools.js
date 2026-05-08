@@ -768,6 +768,197 @@ export async function get_recent_errors({ limit = 5 } = {}) {
 }
 
 // ============================================================================
+// get_tour_breakdown
+// Desglosa actividad turística (vendedores, guías, agencias, pasajeros, %cierre)
+// para un periodo, agregando los archived_quick_capture_reports.metrics.
+// ============================================================================
+export async function get_tour_breakdown({ period = 'this_month', date_from, date_to, branch_name, limit = 10 } = {}) {
+  const { from, to, label } = periodToRange(period, date_from, date_to);
+  const fromDate = from.toISOString().slice(0, 10);
+  const toDate = new Date(to.getTime() - 86400000).toISOString().slice(0, 10);
+
+  try {
+    let branchFilter = '';
+    const params = [fromDate, toDate];
+    if (branch_name) {
+      branchFilter = `AND b.name ILIKE $3`;
+      params.push(`%${branch_name}%`);
+    }
+
+    // 1) Datos archivados (consolidados, source of truth)
+    const archived = await posQuery(`
+      SELECT r.report_date, r.metrics, b.name AS branch_name
+      FROM archived_quick_capture_reports r
+      LEFT JOIN branches b ON r.branch_id = b.id
+      WHERE r.report_date >= $1::date AND r.report_date <= $2::date
+        AND r.metrics IS NOT NULL
+        ${branchFilter}
+      ORDER BY r.report_date
+    `, params);
+
+    // 2) Datos en vivo (no-archivados aún) — quick_captures + arrivals
+    let liveCaptures = { rows: [] };
+    let liveArrivals = { rows: [] };
+    try {
+      const params2 = [fromDate, toDate];
+      let bf = '';
+      if (branch_name) { bf = `AND b.name ILIKE $3`; params2.push(`%${branch_name}%`); }
+      liveCaptures = await posQuery(`
+        SELECT
+          qc.seller_id, cs.name AS seller_name,
+          qc.guide_id, cg.name AS guide_name,
+          qc.agency_id, ca.name AS agency_name,
+          b.name AS branch_name,
+          qc.total::numeric AS total,
+          qc.currency
+        FROM quick_captures qc
+        LEFT JOIN catalog_sellers cs ON qc.seller_id = cs.id
+        LEFT JOIN catalog_guides  cg ON qc.guide_id  = cg.id
+        LEFT JOIN catalog_agencies ca ON qc.agency_id = ca.id
+        LEFT JOIN branches b ON qc.branch_id = b.id
+        WHERE qc.date >= $1::date AND qc.date <= $2::date
+        ${bf}
+      `, params2);
+      // arrivals viven en jsonb por ahora; usar agency_arrivals si tiene datos, sino skip
+      liveArrivals = await posQuery(`
+        SELECT
+          aa.passengers::int AS passengers,
+          aa.agency_id, ca.name AS agency_name,
+          b.name AS branch_name
+        FROM agency_arrivals aa
+        LEFT JOIN catalog_agencies ca ON aa.agency_id = ca.id
+        LEFT JOIN branches b ON aa.branch_id = b.id
+        WHERE aa.date >= $1::date AND aa.date <= $2::date
+        ${bf}
+      `, params2);
+    } catch (_) { /* live data optional */ }
+
+    // 3) Agregar métricas archivadas
+    const sellers = new Map(); // seller_name -> { ventas, total_mxn, branches:Set }
+    const guides = new Map();  // guide_name  -> { ventas, total_mxn, pasajeros, agency, branches:Set }
+    const agencies = new Map();// agency_name -> { ventas, total_mxn, pasajeros, branches:Set }
+    const branchesAcc = new Map();
+    let totalPasajeros = 0;
+    let totalVentas = 0;
+
+    for (const r of archived.rows) {
+      const m = r.metrics || {};
+      const bName = r.branch_name || 'desconocida';
+      branchesAcc.set(bName, (branchesAcc.get(bName) || 0) + (m.general?.total_ventas || 0));
+      totalPasajeros += parseInt(m.general?.total_pasajeros || 0);
+      totalVentas    += parseInt(m.general?.total_ventas || 0);
+
+      for (const v of (m.por_vendedor || [])) {
+        const k = v.seller_name || 'sin_nombre';
+        const cur = sellers.get(k) || { ventas: 0, total_mxn: 0, branches: new Set() };
+        cur.ventas    += parseInt(v.ventas || 0);
+        cur.total_mxn += parseFloat(v.total_ventas_mxn || 0);
+        cur.branches.add(bName);
+        sellers.set(k, cur);
+      }
+      for (const g of (m.por_guia || [])) {
+        const k = g.guide_name || 'sin_nombre';
+        const cur = guides.get(k) || { ventas: 0, total_mxn: 0, pasajeros: 0, agencia: g.agency_name || null, branches: new Set() };
+        cur.ventas    += parseInt(g.ventas || 0);
+        cur.total_mxn += parseFloat(g.total_ventas_mxn || 0);
+        cur.pasajeros += parseInt(g.pasajeros || 0);
+        if (!cur.agencia && g.agency_name) cur.agencia = g.agency_name;
+        cur.branches.add(bName);
+        guides.set(k, cur);
+      }
+      for (const a of (m.por_agencia || [])) {
+        const k = a.agency_name || 'sin_nombre';
+        const cur = agencies.get(k) || { ventas: 0, total_mxn: 0, pasajeros: 0, branches: new Set() };
+        cur.ventas    += parseInt(a.ventas || 0);
+        cur.total_mxn += parseFloat(a.total_ventas_mxn || 0);
+        cur.pasajeros += parseInt(a.pasajeros || 0);
+        cur.branches.add(bName);
+        agencies.set(k, cur);
+      }
+    }
+
+    // 4) Agregar métricas en vivo (quick_captures live) — usa USD×20, CAD×14.5 igual que UNIFIED_SALES_CTE
+    for (const c of (liveCaptures.rows || [])) {
+      const t = parseFloat(c.total || 0);
+      const tmxn = c.currency === 'USD' ? t * 20 : c.currency === 'CAD' ? t * 14.5 : t;
+      if (c.seller_name) {
+        const cur = sellers.get(c.seller_name) || { ventas: 0, total_mxn: 0, branches: new Set() };
+        cur.ventas += 1; cur.total_mxn += tmxn; cur.branches.add(c.branch_name || 'desconocida');
+        sellers.set(c.seller_name, cur);
+      }
+      if (c.guide_name) {
+        const cur = guides.get(c.guide_name) || { ventas: 0, total_mxn: 0, pasajeros: 0, agencia: c.agency_name || null, branches: new Set() };
+        cur.ventas += 1; cur.total_mxn += tmxn; cur.branches.add(c.branch_name || 'desconocida');
+        if (!cur.agencia && c.agency_name) cur.agencia = c.agency_name;
+        guides.set(c.guide_name, cur);
+      }
+      if (c.agency_name) {
+        const cur = agencies.get(c.agency_name) || { ventas: 0, total_mxn: 0, pasajeros: 0, branches: new Set() };
+        cur.ventas += 1; cur.total_mxn += tmxn; cur.branches.add(c.branch_name || 'desconocida');
+        agencies.set(c.agency_name, cur);
+      }
+      totalVentas += 1;
+    }
+    for (const a of (liveArrivals.rows || [])) {
+      const pax = parseInt(a.passengers || 0);
+      totalPasajeros += pax;
+      if (a.agency_name) {
+        const cur = agencies.get(a.agency_name) || { ventas: 0, total_mxn: 0, pasajeros: 0, branches: new Set() };
+        cur.pasajeros += pax; cur.branches.add(a.branch_name || 'desconocida');
+        agencies.set(a.agency_name, cur);
+      }
+    }
+
+    const sellersOut = [...sellers.entries()]
+      .map(([name, v]) => ({ seller: name, ventas: v.ventas, total_mxn: Math.round(v.total_mxn), sucursales: [...v.branches] }))
+      .sort((a, b) => b.total_mxn - a.total_mxn).slice(0, limit);
+    const guidesOut = [...guides.entries()]
+      .map(([name, v]) => ({
+        guide: name, ventas: v.ventas, pasajeros: v.pasajeros,
+        total_mxn: Math.round(v.total_mxn),
+        agencia: v.agencia,
+        cierre_pct: v.pasajeros > 0 ? +(100 * v.ventas / v.pasajeros).toFixed(2) : null,
+        sucursales: [...v.branches],
+      }))
+      .sort((a, b) => b.total_mxn - a.total_mxn).slice(0, limit);
+    const agenciesOut = [...agencies.entries()]
+      .map(([name, v]) => ({
+        agencia: name, ventas: v.ventas, pasajeros: v.pasajeros,
+        total_mxn: Math.round(v.total_mxn),
+        cierre_pct: v.pasajeros > 0 ? +(100 * v.ventas / v.pasajeros).toFixed(2) : null,
+        sucursales: [...v.branches],
+      }))
+      .sort((a, b) => b.total_mxn - a.total_mxn).slice(0, limit);
+
+    const cierreGlobal = totalPasajeros > 0 ? +(100 * totalVentas / totalPasajeros).toFixed(2) : null;
+    const topSeller = sellersOut[0];
+    const topGuide  = guidesOut[0];
+    const topAgency = agenciesOut[0];
+
+    return {
+      ok: true,
+      period: label,
+      branch_filter: branch_name || 'todas',
+      total_ventas: totalVentas,
+      total_pasajeros: totalPasajeros,
+      cierre_global_pct: cierreGlobal,
+      vendedores_activos: sellers.size,
+      guias_activos: guides.size,
+      agencias_activas: agencies.size,
+      top_vendedores: sellersOut,
+      top_guias: guidesOut,
+      top_agencias: agenciesOut,
+      summary: [
+        `${label}: ${totalVentas} ventas, ${totalPasajeros} pax, cierre ${cierreGlobal ?? 'n/a'}%`,
+        topSeller ? `Top vendedor: ${topSeller.seller} ${fmtMxn(topSeller.total_mxn)}` : null,
+        topGuide ? `Top guía: ${topGuide.guide} (${topGuide.agencia || 's/agencia'}) ${topGuide.ventas} ventas / ${topGuide.pasajeros} pax` : null,
+        topAgency ? `Top agencia: ${topAgency.agencia} ${fmtMxn(topAgency.total_mxn)} (${topAgency.pasajeros} pax)` : null,
+      ].filter(Boolean).join('. '),
+    };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ============================================================================
 // restart_backend (Railway)
 // ============================================================================
 export async function restart_backend() {
@@ -981,6 +1172,17 @@ export const TOOL_DEFINITIONS = [
     parameters: { type: 'object', properties: { limit: { type: 'number' } } },
   },
   {
+    type: 'function', name: 'get_tour_breakdown',
+    description: 'Desglose COMPLETO de actividad turística por periodo: total pasajeros, total ventas, % cierre global, top vendedores con monto, top guías con pasajeros y agencia, top agencias con pax y cierre%. Usa esto cuando Carlos pida desglose mensual de ventas turismo, quién vendió más, qué agencia trajo más pax, qué guía vendió más, % de cierre, etc.',
+    parameters: { type: 'object', properties: {
+      period: { type: 'string', description: 'today, yesterday, this_month, last_month, marzo_2026, abril, etc.' },
+      date_from: { type: 'string' },
+      date_to: { type: 'string' },
+      branch_name: { type: 'string', description: 'Filtra por sucursal: MALECON, SAN SEBASTIAN, SAYULITA, L VALLARTA' },
+      limit: { type: 'integer', description: 'Top N en cada categoría (default 10)' },
+    } },
+  },
+  {
     type: 'function', name: 'restart_backend',
     description: 'REINICIA el backend del POS en Railway (downtime ~30-60s). Úsalo SOLO cuando Carlos pida explícitamente "reinicia el backend". CONFIRMA verbalmente antes.',
     parameters: { type: 'object', properties: {} },
@@ -1019,6 +1221,7 @@ export async function dispatchTool(name, args) {
     case 'get_recent_sales':       return get_recent_sales(args);
     case 'get_sales_by_month':     return get_sales_by_month(args);
     case 'compare_periods':        return compare_periods(args);
+    case 'get_tour_breakdown':     return get_tour_breakdown(args);
     case 'get_recent_errors':      return get_recent_errors(args);
     case 'restart_backend':        return restart_backend();
     case 'create_issue':           return create_issue(args);

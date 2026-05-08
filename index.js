@@ -45,6 +45,7 @@ IMPORTANTE: cuando Carlos pregunte "¿qué te pedí?", "¿qué teníamos pendien
 - get_top_products → "¿qué se vendió más?"
 - get_top_customers → "mejores clientes"
 - get_recent_sales → "última venta", "ventas recientes"
+- get_tour_breakdown → DESGLOSE TURISMO COMPLETO. Usa esto cuando Carlos pida desglose mensual: pasajeros totales, % cierre, top vendedores con monto, top guías con pax+agencia, top agencias con pax+cierre. Acepta period, branch_name, limit. Reporta TODOS los rankings (no solo el #1) si son varios.
 
 ** Inventario **
 - get_inventory_summary → "¿cuánto inventario tengo?", "valor del inventario"
